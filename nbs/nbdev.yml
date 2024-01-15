@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "nbcmc"
+  site-url: "https://ymoisan.github.io/nbcmc"
+  description: "Notebooks for use at CMC."
+  repo-branch: main
+  repo-url: "https://github.com/ymoisan/nbcmc"
