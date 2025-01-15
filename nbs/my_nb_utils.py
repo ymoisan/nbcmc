@@ -13,6 +13,36 @@ import zipfile
 from urllib.request import urlretrieve
 from ftplib import FTP
 
+from pathlib import Path
+import geopandas as gpd
+from deltalake import DeltaTable
+from deltalake.writer import write_deltalake
+
+def write_gdf_to_delta(gdf: gpd.GeoDataFrame, table_name: str, mode: str = "overwrite") -> None:
+    """
+    Write a GeoDataFrame to a Delta Lake table in the current working directory.
+    
+    Args:
+        gdf (gpd.GeoDataFrame): The GeoDataFrame to write
+        table_name (str): Name of the Delta table (will be created as a directory)
+        mode (str): Write mode - either "overwrite" or "append". Defaults to "overwrite"
+    
+    Returns:
+        None
+    """
+    # Ensure table_name doesn't have file extension
+    table_name = Path(table_name).stem
+    
+    # Convert to pandas DataFrame (Delta Lake writer doesn't directly support GeoDataFrame)
+    df = gdf.to_pandas()
+    
+    # Write to Delta table
+    write_deltalake(
+        table_name,
+        df,
+        mode=mode
+    )
+
 # Function to extract data from XML and return as a Pandas DataFrame
 def extract_xml_data_to_pd(xml_data):
     '''
@@ -410,8 +440,13 @@ def read_and_concat_gpkgs(file_paths_or_urls, layer='geoai_buildings', target_cr
                         'to': target_crs
                     })
                 
-                # Add source file information
-                gdf['source_file'] = os.path.basename(path_or_url)
+                # Extract filename and province code
+                filename = os.path.basename(path_or_url)
+                province_code = filename.split('_')[0]  # Gets 'BC', 'NB', etc.
+                
+                # Add source file information and province code
+                gdf['source_file'] = filename
+                gdf['province_code'] = province_code
                 gdf['processing_timestamp'] = pd.Timestamp.now()
                 gdf['original_crs'] = str(original_crs)
                 
@@ -461,7 +496,8 @@ def prepare_gdf_for_delta(gdf):
         'null_counts': {},
         'data_types': {},
         'invalid_geometries': 0,
-        'type_conversion_issues': {}
+        'type_conversion_issues': {},
+        'duplicate_buil_fids': 0
     }
     
     # Create a copy to avoid modifying the original
@@ -473,15 +509,14 @@ def prepare_gdf_for_delta(gdf):
     # Store the CRS before converting to WKB
     geometry_crs = str(gdf.crs)
     
-    # Convert geometry to WKB
-    df['geometry_wkb'] = df.geometry.apply(lambda geom: geom.wkb if geom else None)
-    df.loc[df['geometry_wkb'].isnull(), 'quality_comments'] += 'Invalid geometry; '
+    # Convert geometry to WKB and store as 'geometry'
+    df['geometry'] = gdf.geometry.apply(lambda geom: geom.wkb if geom else None)
     
     # Add geometry CRS information
     df['geometry_crs'] = geometry_crs
     
-    # Drop the original geometry column
-    df = pd.DataFrame(df.drop(columns='geometry'))
+    # Convert to regular DataFrame (drop GeoDataFrame-specific stuff)
+    df = pd.DataFrame(df)
     
     # Record null counts for each column
     quality_stats['null_counts'] = df.isnull().sum().to_dict()
@@ -490,10 +525,10 @@ def prepare_gdf_for_delta(gdf):
     quality_stats['data_types'] = df.dtypes.astype(str).to_dict()
     
     # Count invalid geometries (None or empty WKB)
-    quality_stats['invalid_geometries'] = df['geometry_wkb'].isnull().sum()
+    quality_stats['invalid_geometries'] = df['geometry'].isnull().sum()
     
     # Add data quality indicator
-    df['has_valid_geometry'] = df['geometry_wkb'].notnull()
+    df['has_valid_geometry'] = df['geometry'].notnull()
     
     # Check for NaN values in numeric columns before conversion
     numeric_cols = ['area', 'perimeter']
@@ -534,6 +569,17 @@ def prepare_gdf_for_delta(gdf):
     
     # Clean up empty comments
     df['quality_comments'] = df['quality_comments'].str.rstrip('; ')
+    
+    # Check for duplicate buil_fids
+    if 'buil_fid' in df.columns:
+        duplicates = df[df['buil_fid'].duplicated(keep=False)]
+        if not duplicates.empty:
+            quality_stats['duplicate_buil_fids'] = len(duplicates)
+            # Group duplicates to get all source files for each duplicate buil_fid
+            for fid, group in duplicates.groupby('buil_fid'):
+                source_files = group['source_file'].unique()
+                comment = f'Duplicate buil_fid {fid} found in: {", ".join(source_files)}'
+                df.loc[group.index, 'quality_comments'] += comment + '; '
     
     return df, quality_stats
 
@@ -697,4 +743,453 @@ def get_all_gpkg_data(layer='geoai_buildings', target_crs='EPSG:4326'):
     print(f"  Latest file:   {processing_stats['upload_date_range']['latest'].strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
     
+    if quality_stats['duplicate_buil_fids'] > 0:
+        print("\nDuplicate Building IDs:")
+        print(f"  Total duplicates found:    {quality_stats['duplicate_buil_fids']:>6}")
+        duplicates = df[df['buil_fid'].duplicated(keep=False)]
+        print("\nSample of duplicates:")
+        for fid, group in duplicates.groupby('buil_fid').head(3):
+            print(f"\nbuil_fid {fid} appears in:")
+            for _, row in group.iterrows():
+                print(f"  - {row['source_file']} (area: {row['area']}, perimeter: {row['perimeter']})")
+    else:
+        print("\nNo duplicate buil_fids found in the dataset")
+    
     return final_df, processing_stats
+
+def verify_geoparquet_bbox(file_path):
+    """
+    Verify that a GeoParquet file has bbox information
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the GeoParquet file
+    
+    Returns:
+    --------
+    bool
+        True if bbox information is present
+    """
+    import pyarrow.parquet as pq
+    
+    # Read the parquet file metadata
+    parquet_file = pq.ParquetFile(file_path)
+    metadata = parquet_file.metadata
+    
+    # Get the file metadata (stored as a serialized JSON string)
+    file_metadata = metadata.metadata
+    
+    # Check for GeoParquet metadata
+    has_bbox = False
+    if b'geo' in file_metadata:
+        import json
+        geo_meta = json.loads(file_metadata[b'geo'].decode('utf-8'))
+        has_bbox = 'bbox' in geo_meta.get('columns', {}).get('geometry', {})
+        bbox_value = geo_meta.get('columns', {}).get('geometry', {}).get('bbox')
+        return has_bbox, bbox_value
+    return False, None
+
+def clean_province_code(code):
+    """
+    Clean province codes by removing numbers and known suffixes
+    
+    Parameters:
+    -----------
+    code : str
+        Province code to clean
+    
+    Returns:
+    --------
+    str
+        Cleaned province code
+    """
+    if pd.isna(code):
+        return code
+    
+    # Extract first two characters for standard province codes
+    base_code = str(code)[:2].upper()
+    
+    # Map for special cases
+    if base_code == 'PE' or 'PEI' in str(code).upper():
+        return 'PE'
+    
+    return base_code
+
+def save_processed_data(df, base_path="processed_data", original_size_mb=None, partition_by=None, geometry_encoding="wkb"):
+    """
+    Save processed DataFrame to parquet format
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame to save
+    base_path : str, optional
+        Base path for saving files (default: "processed_data")
+    original_size_mb : float, optional 
+        Original file size in MB for comparison
+    partition_by : str, optional
+        Column to partition by
+    geometry_encoding : str, optional
+        Encoding for geometry column ('wkb' or 'geoarrow')
+        
+    Returns:
+    --------
+    Path
+        Full path to the saved file
+    """
+    from shapely import wkb
+    from shapely.geometry.base import BaseGeometry
+    import geopandas as gpd
+    from pathlib import Path
+    import pandas as pd
+    from datetime import datetime
+    
+    # Handle base path - use current directory by default
+    base_path = Path(base_path)
+    base_path.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename with timestamp and parameters
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename_parts = ["geoai_buildings", timestamp]
+    if partition_by:
+        filename_parts.append(f"partition_{partition_by}")
+    filename_parts.append(geometry_encoding)
+    filename = "_".join(filename_parts) + ".parquet"
+    
+    # If input is already a GeoDataFrame, make a copy
+    if isinstance(df, gpd.GeoDataFrame):
+        gdf = df.copy()
+    else:
+        # Convert to GeoDataFrame if it isn't already
+        gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
+    
+    # Remove rows with None geometries
+    gdf = gdf.dropna(subset=['geometry'])
+    
+    # Add bounding box column as a struct following GeoParquet 1.1 spec
+    import pyarrow as pa
+    
+    # Create bbox struct array with named fields
+    bbox_list = [
+        {
+            'minx': bounds[0],
+            'miny': bounds[1],
+            'maxx': bounds[2],
+            'maxy': bounds[3]
+        }
+        for bounds in gdf.geometry.bounds.values
+    ]
+    bbox_array = pa.array(bbox_list, type=pa.struct([
+        ('minx', pa.float64()),
+        ('miny', pa.float64()),
+        ('maxx', pa.float64()),
+        ('maxy', pa.float64())
+    ]))
+    
+    # Add bbox column to the GeoDataFrame
+    gdf['bbox'] = bbox_array
+    
+    # Convert to pandas DataFrame and handle geometry at the last moment
+    df_save = pd.DataFrame(gdf)
+    
+    # Convert geometries to WKB for saving
+    def convert_geometry(geom):
+        if isinstance(geom, BaseGeometry):
+            return geom.wkb
+        if isinstance(geom, (bytes, str)):
+            return geom
+        raise ValueError(f"Unexpected geometry type: {type(geom)}")
+        
+    df_save['geometry'] = df_save['geometry'].apply(convert_geometry)
+    
+    # Save to parquet
+    if partition_by:
+        df_save.to_parquet(
+            base_path / filename,
+            partition_cols=[partition_by],
+            engine='pyarrow',
+            index=False
+        )
+        print(f"Saved partitioned data to: {(base_path / filename).absolute()}")
+    else:
+        output_path = base_path / filename
+        df_save.to_parquet(
+            output_path,
+            engine='pyarrow',
+            index=False
+        )
+        print(f"Saved data to: {output_path.absolute()}")
+        
+    # Print size comparison if original size was provided
+    if original_size_mb:
+        saved_size = sum(f.stat().st_size for f in Path(base_path).rglob('*.parquet')) / (1024 * 1024)
+        print(f"Original size: {original_size_mb:.2f} MB")
+        print(f"Saved size: {saved_size:.2f} MB")
+        print(f"Compression ratio: {original_size_mb/saved_size:.2f}x")
+    
+    return base_path / filename
+
+def analyze_overlaps(df, merge=False, min_area=1.0):
+    """
+    Quick analysis of overlapping building footprints
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame with WKB geometry column
+    merge : bool, optional
+        If True, merge overlapping polygons while keeping non-overlapping ones (default: False)
+    min_area : float, optional
+        Minimum area in square meters for valid buildings (default: 1.0)
+    
+    Returns:
+    --------
+    dict
+        Dictionary containing:
+        - overlap_stats: Basic statistics about overlaps
+        - merged_footprints: GeoDataFrame with all geometries (merged where overlapping) if merge=True
+        
+    Notes:
+    ------
+    - For merged features:
+      - subproj_id is kept only if all merged features share the same value, else None
+      - buil_fid is set to -merged_count (e.g., -3 for a merge of 3 features)
+    """
+    import geopandas as gpd
+    import pandas as pd
+    from shapely import wkb
+    from shapely.geometry import Polygon, MultiPolygon
+    from shapely.ops import unary_union
+    from functools import reduce
+    
+    # If input is already a GeoDataFrame, make a copy
+    if isinstance(df, gpd.GeoDataFrame):
+        gdf = df.copy()
+    else:
+        # Convert WKB to GeoDataFrame
+        gdf = gpd.GeoDataFrame(df.copy(), geometry=df['geometry'].apply(wkb.loads), crs="EPSG:4326")
+    
+    # Convert to appropriate UTM zone for accurate area calculations
+    utm_crs = get_utm_crs(gdf.total_bounds[0], gdf.total_bounds[1])
+    gdf_utm = gdf.to_crs(utm_crs)
+    
+    # Filter out tiny polygons using UTM area
+    gdf_utm = gdf_utm[gdf_utm.geometry.area >= min_area]
+    
+    # Convert back to WGS84 for consistent output
+    gdf = gdf_utm.to_crs("EPSG:4326")
+    
+    # Ensure buil_fid and subproj_id are integers and drop rows with NA
+    if 'buil_fid' in gdf.columns and 'subproj_id' in gdf.columns:
+        gdf = gdf.dropna(subset=['buil_fid', 'subproj_id'])
+        gdf['buil_fid'] = gdf['buil_fid'].astype('Int64')
+        gdf['subproj_id'] = gdf['subproj_id'].astype('Int64')
+    
+    # Use sjoin to find overlaps more efficiently
+    potential_overlaps = gpd.sjoin(gdf, gdf, how='inner', predicate='intersects')
+    
+    # Remove self-intersections
+    overlaps = potential_overlaps[potential_overlaps.index != potential_overlaps.index_right]
+    
+    # Basic statistics
+    overlap_stats = {
+        'total_buildings': len(gdf),
+        'buildings_with_overlaps': len(set(overlaps.index) | set(overlaps.index_right)),
+        'overlap_pairs': len(overlaps)
+    }
+    
+    results = {'overlap_stats': overlap_stats}
+    
+    if merge:
+        # Get indices of overlapping features
+        overlapping_idx = set(overlaps.index) | set(overlaps.index_right)
+        
+        # Split into overlapping and non-overlapping
+        overlapping = gdf.loc[list(overlapping_idx)]
+        non_overlapping = gdf.loc[~gdf.index.isin(overlapping_idx)]
+        
+        # Convert overlapping features to UTM for merging and area calculation
+        overlapping_utm = overlapping.to_crs(utm_crs)
+        
+        # Process overlapping geometries in groups
+        merged_features = []
+        skip_idx = set()
+        
+        for idx in overlapping_idx:
+            if idx in skip_idx:
+                continue
+                
+            # Get all features that overlap with this one
+            related = overlaps[overlaps.index == idx].index_right.tolist()
+            related.append(idx)
+            
+            # Get geometries and data for this group
+            group_data = overlapping_utm.loc[related]
+            group_geoms = group_data.geometry.tolist()
+            
+            # Merge using union of all geometries (in UTM)
+            merged = reduce(lambda x, y: x.union(y), group_geoms)
+            
+            # Only keep if result is a simple Polygon and has sufficient area
+            if isinstance(merged, Polygon) and merged.area >= min_area:
+                # Check if all features in group have same subproj_id
+                unique_subproj_ids = group_data['subproj_id'].unique()
+                subproj_id = pd.NA if len(unique_subproj_ids) > 1 else unique_subproj_ids[0]
+                
+                # For merged features, use negative count as buil_fid
+                merged_count = len(related)
+                merged_buil_fid = -merged_count
+                
+                merged_features.append({
+                    'geometry': merged,  # UTM geometry
+                    'area': merged.area,
+                    'perimeter': merged.length,
+                    'subproj_id': subproj_id,
+                    'buil_fid': merged_buil_fid
+                })
+                skip_idx.update(related)
+            else:
+                # If merge results in MultiPolygon or tiny area, keep original features with original metrics
+                for _, row in group_data.iterrows():
+                    merged_features.append({
+                        'geometry': row.geometry,
+                        'area': overlapping.loc[row.name, 'area'],  # Keep original area
+                        'perimeter': overlapping.loc[row.name, 'perimeter'],  # Keep original perimeter
+                        'subproj_id': row.subproj_id,
+                        'buil_fid': row.buil_fid
+                    })
+        
+        # Create GeoDataFrame with merged overlapping geometries
+        if merged_features:
+            # Convert merged geometries back to WGS84
+            merged_overlapping = gpd.GeoDataFrame(merged_features, crs=utm_crs).to_crs("EPSG:4326")
+        else:
+            merged_overlapping = gpd.GeoDataFrame(
+                columns=['geometry', 'area', 'perimeter', 'subproj_id', 'buil_fid'],
+                geometry='geometry',
+                crs="EPSG:4326"
+            )
+        
+        # Keep non-overlapping features as they are
+        if len(non_overlapping) > 0:
+            final_gdf = gpd.GeoDataFrame(pd.concat([
+                merged_overlapping,
+                non_overlapping
+            ], ignore_index=True))
+        else:
+            final_gdf = merged_overlapping
+        
+        # Ensure integer types only if we have data
+        if len(final_gdf) > 0:
+            final_gdf['subproj_id'] = final_gdf['subproj_id'].astype('Int64')
+            final_gdf['buil_fid'] = final_gdf['buil_fid'].astype('Int64')
+        
+        results['merged_footprints'] = final_gdf
+        results['merge_stats'] = {
+            'original_count': len(gdf),
+            'final_count': len(final_gdf),
+            'overlapping_merged': len(overlapping),
+            'non_overlapping': len(non_overlapping),
+            'reduction': len(gdf) - len(final_gdf)
+        }
+    
+    return results
+
+def to_polars(df):
+    """
+    Convert pandas/geopandas DataFrame to polars DataFrame
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame or geopandas.GeoDataFrame
+        DataFrame to convert
+    
+    Returns:
+    --------
+    polars.DataFrame
+        Converted DataFrame
+    """
+    import polars as pl
+    
+    # Convert to pandas first if it's a GeoDataFrame
+    if hasattr(df, 'geometry'):
+        df = pd.DataFrame(df)
+    
+    # Convert to polars
+    return pl.from_pandas(df)
+
+def get_building_stats(gdf):
+    """
+    Calculate statistics for building footprints
+    
+    Parameters:
+    -----------
+    gdf : geopandas.GeoDataFrame
+        GeoDataFrame with building footprints
+    
+    Returns:
+    --------
+    dict
+        Dictionary containing:
+        - count: Total number of buildings
+        - total_area: Total area of all buildings
+        - mean_area: Mean building area
+        - median_area: Median building area
+        - area_std: Standard deviation of building areas
+        - total_perimeter: Total perimeter of all buildings
+        - mean_perimeter: Mean building perimeter
+        - median_perimeter: Median building perimeter
+        - perimeter_std: Standard deviation of building perimeters
+    """
+    import numpy as np
+    
+    stats = {
+        'count': len(gdf),
+        'total_area': gdf.area.sum(),
+        'mean_area': gdf.area.mean(),
+        'median_area': gdf.area.median(),
+        'area_std': gdf.area.std(),
+        'total_perimeter': gdf.geometry.length.sum(),
+        'mean_perimeter': gdf.geometry.length.mean(),
+        'median_perimeter': gdf.geometry.length.median(),
+        'perimeter_std': gdf.geometry.length.std()
+    }
+    
+    return stats
+
+def load_processed_data(path, as_geodataframe=True):
+    """
+    Load processed data from parquet format
+    
+    Parameters:
+    -----------
+    path : str or Path
+        Path to parquet file or directory
+    as_geodataframe : bool, optional
+        If True, return as GeoDataFrame, else as pandas DataFrame (default: True)
+    
+    Returns:
+    --------
+    geopandas.GeoDataFrame or pandas.DataFrame
+        Loaded data
+    """
+    import pandas as pd
+    import geopandas as gpd
+    from pathlib import Path
+    from shapely import wkb
+    
+    path = Path(path)
+    
+    # Handle directory vs file
+    if path.is_dir():
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_parquet(str(path))
+    
+    if as_geodataframe and 'geometry' in df.columns:
+        # Convert WKB to geometry objects
+        df['geometry'] = df['geometry'].apply(lambda x: wkb.loads(x) if x else None)
+        return gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
+    
+    return df
